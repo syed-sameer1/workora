@@ -1,14 +1,30 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from database import Base, engine, SessionLocal
 from models import User
 from schemas import RegisterSchema, LoginSchema, EditProfileSchema
 from auth import hash_password, verify_password, create_token
 from recommender import recommend_jobs_from_db
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
+from jose import jwt, JWTError
 
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Job Recommendation System")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # for development only
+    allow_credentials=True,
+    allow_methods=["*"],  # IMPORTANT
+    allow_headers=["*"],  # IMPORTANT
+)
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+SECRET_KEY = "secret123"   # SAME as create_token
+ALGORITHM = "HS256"
 
 def get_db():
     db = SessionLocal()
@@ -36,11 +52,25 @@ def register(data: RegisterSchema, db: Session = Depends(get_db)):
 @app.post("/login")
 def login(data: LoginSchema, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == data.email).first()
+
     if not user or not verify_password(data.password, user.password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = create_token({"user_id": user.id})
-    return {"access_token": token}
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "id": user.id,
+            "name": user.name,
+            "email": user.email,
+            "experience": user.experience,
+            "education": user.education,
+            "skills": user.skills.split(",") if user.skills else []
+        }
+    }
+
 
 # ✅ Dashboard (Recommended Jobs)
 @app.get("/dashboard/{user_id}")
@@ -48,12 +78,59 @@ def dashboard(user_id: int, db: Session = Depends(get_db)):
     user = db.query(User).get(user_id)
     return recommend_jobs_from_db(user, db)
 
+
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db)
+):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: int = payload.get("user_id")
+
+        if user_id is None:
+            raise credentials_exception
+
+    except JWTError:
+        raise credentials_exception
+
+    user = db.query(User).filter(User.id == user_id).first()
+
+    if user is None:
+        raise credentials_exception
+
+    return user
+
 # ✅ Edit Profile
-@app.put("/edit-profile/{user_id}")
-def edit_profile(user_id: int, data: EditProfileSchema, db: Session = Depends(get_db)):
-    user = db.query(User).get(user_id)
-    user.experience = data.experience
-    user.education = data.education
-    user.skills = ",".join(data.skills)
+@app.put("/edit-profile")
+def edit_profile(
+    data: EditProfileSchema,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if data.experience is not None:
+        current_user.experience = data.experience
+
+    if data.education is not None:
+        current_user.education = data.education
+
+    if data.skills is not None:
+        current_user.skills = ",".join(data.skills)
+
+    db.add(current_user)        # 🔥 IMPORTANT
     db.commit()
-    return {"message": "Profile updated"}
+    db.refresh(current_user)    # 🔥 IMPORTANT
+
+    return {
+        "message": "Profile updated",
+        "user": {
+            "experience": current_user.experience,
+            "education": current_user.education,
+            "skills": current_user.skills
+        }
+    }
